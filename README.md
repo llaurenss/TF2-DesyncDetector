@@ -8,6 +8,8 @@ Made because JumpQoL doesn't work for 64 bit so until that is supported this can
 
 Note that if you do use this with the TAS plugin the warnings shown during playback are inaccurate so those should all be ignored.
 
+Download compiled plugin here: https://github.com/llaurenss/TF2-DesyncDetector/releases
+
 ## Convars
 
 - `sm_desyncdetector_enabled 1` - Enable desync detector.
