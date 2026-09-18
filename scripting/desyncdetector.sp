@@ -5,8 +5,9 @@
 #include <sdktools>
 #include <sdkhooks>
 
-#define PLUGIN_VERSION "1.0"
+#define PLUGIN_VERSION "2.0"
 #define MAX_EDICTS (1 << 11)
+#define INVALID_ROCKET_INDEX -1
 #define DESYNC_SOUND "misc/banana_slip.wav"
 
 public Plugin myinfo =
@@ -24,19 +25,27 @@ ConVar g_cvBlockDamage;
 ConVar g_cvSound;
 
 int g_iCmdSerial[MAXPLAYERS + 1];
+int g_iCmdTickBaseBefore[MAXPLAYERS + 1];
 bool g_bInsideRunCmd[MAXPLAYERS + 1];
 bool g_bDetectorEnabled[MAXPLAYERS + 1];
 bool g_bShowAllDeltas[MAXPLAYERS + 1];
 bool g_bDebugDetails[MAXPLAYERS + 1];
-bool g_bJumpQoLLoaded;
 
 int g_iRocketOwner[MAX_EDICTS];
 int g_iRocketRef[MAX_EDICTS];
 int g_iRocketCreatedCmd[MAX_EDICTS];
-int g_iRocketCreatedTick[MAX_EDICTS];
+int g_iRocketSimCount[MAX_EDICTS];
+float g_flRocketLastOrigin[MAX_EDICTS][3];
 bool g_bRocketCreatedInsideCmd[MAX_EDICTS];
 bool g_bRocketDamageChecked[MAX_EDICTS];
 bool g_bRocketDamageBlocked[MAX_EDICTS];
+bool g_bRocketHasLastOrigin[MAX_EDICTS];
+int g_iFirstTrackedRocket;
+int g_iFirstClientRocket[MAXPLAYERS + 1];
+int g_iNextTrackedRocket[MAX_EDICTS];
+int g_iPrevTrackedRocket[MAX_EDICTS];
+int g_iNextClientRocket[MAX_EDICTS];
+int g_iPrevClientRocket[MAX_EDICTS];
 
 public void OnPluginStart()
 {
@@ -46,7 +55,6 @@ public void OnPluginStart()
 	g_cvBlockDamage = CreateConVar("sm_desyncdetector_block_damage", "0", "Block rocket damage when a desync is detected.", _, true, 0.0, true, 1.0);
 	g_cvSound = CreateConVar("sm_desyncdetector_sound", "0", "Play a warning sound when a desync is detected.", _, true, 0.0, true, 1.0);
 	g_cvEnabled.AddChangeHook(ConVarChanged_Enabled);
-	g_bJumpQoLLoaded = LibraryExists("jumpqol");
 
 	RegConsoleCmd("sm_dd", Command_ToggleDetector, "Toggle desync detector for yourself.");
 	RegConsoleCmd("sm_ddall", Command_ToggleDelta, "Toggle printing all desync detector deltas.");
@@ -67,9 +75,19 @@ public void OnMapStart()
 	PrecacheDesyncSound();
 }
 
+public void OnGameFrame()
+{
+	if (!IsDetectorActive())
+		return;
+
+	SampleAllRocketMovement();
+}
+
 public void OnClientDisconnect(int client)
 {
+	ClearClientRockets(client);
 	g_iCmdSerial[client] = 0;
+	g_iCmdTickBaseBefore[client] = 0;
 	g_bInsideRunCmd[client] = false;
 	g_bDetectorEnabled[client] = true;
 	g_bShowAllDeltas[client] = false;
@@ -81,27 +99,10 @@ public void OnClientPutInServer(int client)
 	SDKHook(client, SDKHook_OnTakeDamage, OnClientTakeDamage);
 }
 
-public void OnLibraryAdded(const char[] name)
-{
-	if (!StrEqual(name, "jumpqol"))
-		return;
-
-	g_bJumpQoLLoaded = true;
-	ResetAllState();
-}
-
-public void OnLibraryRemoved(const char[] name)
-{
-	if (!StrEqual(name, "jumpqol"))
-		return;
-
-	g_bJumpQoLLoaded = false;
-	ResetAllState();
-}
-
 public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3], float angles[3], int &weapon, int &subtype, int &cmdnum, int &tickcount, int &seed, int mouse[2])
 {
-	if (IsClientDetectorActive(client)) {
+	if (IsClientDetectorActive(client) && IsHumanPlayer(client)) {
+		g_iCmdTickBaseBefore[client] = GetEntProp(client, Prop_Send, "m_nTickBase");
 		g_iCmdSerial[client]++;
 		g_bInsideRunCmd[client] = true;
 	}
@@ -111,7 +112,19 @@ public Action OnPlayerRunCmd(int client, int &buttons, int &impulse, float vel[3
 
 public void OnPlayerRunCmdPost(int client, int buttons, int impulse, const float vel[3], const float angles[3], int weapon, int subtype, int cmdnum, int tickcount, int seed, const int mouse[2])
 {
+	bool hadCommand = g_bInsideRunCmd[client];
 	g_bInsideRunCmd[client] = false;
+
+	if (!hadCommand || !IsClientDetectorActive(client) || !IsHumanPlayer(client))
+		return;
+
+	int tickBaseDelta = GetEntProp(client, Prop_Send, "m_nTickBase") - g_iCmdTickBaseBefore[client];
+	if (tickBaseDelta != 1) {
+		// Rejected commands must not increase the player's simulation age.
+		g_iCmdSerial[client]--;
+	}
+
+	SampleClientRocketMovement(client);
 }
 
 public void OnEntityCreated(int entity, const char[] classname)
@@ -163,14 +176,17 @@ public Action OnClientTakeDamage(int victim, int &attacker, int &inflictor, floa
 	}
 
 	g_bRocketDamageChecked[inflictor] = true;
+	// Damage proves the rocket reached its final explosion simulation step
+	g_iRocketSimCount[inflictor]++;
+	StoreRocketOrigin(inflictor);
 
 	int tick = GetGameTickCount();
 	int cmdAge;
-	int tickAge;
-	GetRocketAges(owner, inflictor, tick, cmdAge, tickAge);
-	int delta = cmdAge - tickAge;
+	int simAge;
+	GetRocketAges(owner, inflictor, cmdAge, simAge);
+	int delta = cmdAge - simAge;
 	if (delta != 0) {
-		NotifyRocketDelta(owner, tick, cmdAge, tickAge, delta);
+		NotifyRocketDelta(owner, tick, cmdAge, simAge, delta);
 
 		if (g_cvBlockDamage.BoolValue) {
 			g_bRocketDamageBlocked[inflictor] = true;
@@ -178,7 +194,7 @@ public Action OnClientTakeDamage(int victim, int &attacker, int &inflictor, floa
 			return Plugin_Handled;
 		}
 	} else if (g_bShowAllDeltas[owner]) {
-		NotifyRocketDeltaDebug(owner, tick, cmdAge, tickAge, delta);
+		NotifyRocketDeltaDebug(owner, tick, cmdAge, simAge, delta);
 	}
 
 	return Plugin_Continue;
@@ -275,21 +291,86 @@ void TrackRocket(int entity)
 	if (g_iRocketRef[entity] == ref)
 		return;
 
-	int tick = GetGameTickCount();
 	bool createdInsideCmd = g_bInsideRunCmd[owner];
 	if (!createdInsideCmd)
 		return;
 
+	if (g_iRocketRef[entity] != INVALID_ENT_REFERENCE)
+		ClearRocketSlot(entity);
+
 	g_iRocketOwner[entity] = owner;
 	g_iRocketRef[entity] = ref;
 	g_iRocketCreatedCmd[entity] = g_iCmdSerial[owner];
-	g_iRocketCreatedTick[entity] = tick;
+	g_iRocketSimCount[entity] = 0;
 	g_bRocketCreatedInsideCmd[entity] = createdInsideCmd;
 	g_bRocketDamageChecked[entity] = false;
 	g_bRocketDamageBlocked[entity] = false;
+	AddRocketToLists(entity, owner);
+	StoreRocketOrigin(entity);
 }
 
-void NotifyRocketDelta(int client, int tick, int cmdAge, int tickAge, int delta)
+void SampleAllRocketMovement()
+{
+	int entity = g_iFirstTrackedRocket;
+	while (entity != INVALID_ROCKET_INDEX) {
+		int next = g_iNextTrackedRocket[entity];
+		SampleRocketMovement(entity);
+		entity = next;
+	}
+}
+
+void SampleClientRocketMovement(int client)
+{
+	int entity = g_iFirstClientRocket[client];
+	while (entity != INVALID_ROCKET_INDEX) {
+		int next = g_iNextClientRocket[entity];
+		SampleRocketMovement(entity);
+		entity = next;
+	}
+}
+
+bool SampleRocketMovement(int entity)
+{
+	if (!IsTrackedRocket(entity)) {
+		ClearRocketSlot(entity);
+		return false;
+	}
+
+	float origin[3];
+	GetEntPropVector(entity, Prop_Data, "m_vecAbsOrigin", origin);
+
+	if (!g_bRocketHasLastOrigin[entity]) {
+		StoreRocketOriginVector(entity, origin);
+		return false;
+	}
+
+	if (origin[0] == g_flRocketLastOrigin[entity][0]
+		&& origin[1] == g_flRocketLastOrigin[entity][1]
+		&& origin[2] == g_flRocketLastOrigin[entity][2]) {
+		return false;
+	}
+
+	StoreRocketOriginVector(entity, origin);
+	g_iRocketSimCount[entity]++;
+	return true;
+}
+
+void StoreRocketOrigin(int entity)
+{
+	float origin[3];
+	GetEntPropVector(entity, Prop_Data, "m_vecAbsOrigin", origin);
+	StoreRocketOriginVector(entity, origin);
+}
+
+void StoreRocketOriginVector(int entity, const float origin[3])
+{
+	g_flRocketLastOrigin[entity][0] = origin[0];
+	g_flRocketLastOrigin[entity][1] = origin[1];
+	g_flRocketLastOrigin[entity][2] = origin[2];
+	g_bRocketHasLastOrigin[entity] = true;
+}
+
+void NotifyRocketDelta(int client, int tick, int cmdAge, int simAge, int delta)
 {
 	char deltaText[16];
 	FormatSignedDelta(delta, deltaText, sizeof(deltaText));
@@ -300,13 +381,13 @@ void NotifyRocketDelta(int client, int tick, int cmdAge, int tickAge, int delta)
 			tick,
 			deltaText,
 			cmdAge,
-			tickAge);
+			simAge);
 	} else {
 		Notify(client, "[dd] desync at tick %d (%s).", tick, deltaText);
 	}
 }
 
-void NotifyRocketDeltaDebug(int client, int tick, int cmdAge, int tickAge, int delta)
+void NotifyRocketDeltaDebug(int client, int tick, int cmdAge, int simAge, int delta)
 {
 	char deltaText[16];
 	FormatSignedDelta(delta, deltaText, sizeof(deltaText));
@@ -316,7 +397,7 @@ void NotifyRocketDeltaDebug(int client, int tick, int cmdAge, int tickAge, int d
 			tick,
 			deltaText,
 			cmdAge,
-			tickAge);
+			simAge);
 	} else {
 		Notify(client, "[dd] delta at tick %d (%s).", tick, deltaText);
 	}
@@ -352,8 +433,13 @@ void PlayDesyncSound(int client)
 
 void ResetAllState()
 {
+	g_iFirstTrackedRocket = INVALID_ROCKET_INDEX;
+	for (int client = 0; client <= MAXPLAYERS; client++)
+		g_iFirstClientRocket[client] = INVALID_ROCKET_INDEX;
+
 	for (int client = 1; client <= MaxClients; client++) {
 		g_iCmdSerial[client] = 0;
+		g_iCmdTickBaseBefore[client] = 0;
 		g_bInsideRunCmd[client] = false;
 		g_bDetectorEnabled[client] = true;
 		g_bShowAllDeltas[client] = false;
@@ -361,7 +447,7 @@ void ResetAllState()
 	}
 
 	for (int entity = 0; entity < MAX_EDICTS; entity++)
-		ClearRocketSlot(entity);
+		ResetRocketSlot(entity);
 }
 
 void ClearRocketSlot(int entity)
@@ -369,20 +455,79 @@ void ClearRocketSlot(int entity)
 	if (!(0 <= entity < MAX_EDICTS))
 		return;
 
+	if (g_iRocketRef[entity] != INVALID_ENT_REFERENCE)
+		RemoveRocketFromLists(entity);
+
+	ResetRocketSlot(entity);
+}
+
+void ResetRocketSlot(int entity)
+{
 	g_iRocketOwner[entity] = 0;
 	g_iRocketRef[entity] = INVALID_ENT_REFERENCE;
 	g_iRocketCreatedCmd[entity] = 0;
-	g_iRocketCreatedTick[entity] = 0;
+	g_iRocketSimCount[entity] = 0;
+	g_flRocketLastOrigin[entity][0] = 0.0;
+	g_flRocketLastOrigin[entity][1] = 0.0;
+	g_flRocketLastOrigin[entity][2] = 0.0;
 	g_bRocketCreatedInsideCmd[entity] = false;
 	g_bRocketDamageChecked[entity] = false;
 	g_bRocketDamageBlocked[entity] = false;
+	g_bRocketHasLastOrigin[entity] = false;
+	g_iNextTrackedRocket[entity] = INVALID_ROCKET_INDEX;
+	g_iPrevTrackedRocket[entity] = INVALID_ROCKET_INDEX;
+	g_iNextClientRocket[entity] = INVALID_ROCKET_INDEX;
+	g_iPrevClientRocket[entity] = INVALID_ROCKET_INDEX;
 }
 
 void ClearClientRockets(int client)
 {
-	for (int entity = 0; entity < MAX_EDICTS; entity++) {
-		if (g_iRocketOwner[entity] == client)
-			ClearRocketSlot(entity);
+	int entity = g_iFirstClientRocket[client];
+	while (entity != INVALID_ROCKET_INDEX) {
+		int next = g_iNextClientRocket[entity];
+		ClearRocketSlot(entity);
+		entity = next;
+	}
+}
+
+void AddRocketToLists(int entity, int owner)
+{
+	g_iPrevTrackedRocket[entity] = INVALID_ROCKET_INDEX;
+	g_iNextTrackedRocket[entity] = g_iFirstTrackedRocket;
+	if (g_iFirstTrackedRocket != INVALID_ROCKET_INDEX)
+		g_iPrevTrackedRocket[g_iFirstTrackedRocket] = entity;
+	g_iFirstTrackedRocket = entity;
+
+	g_iPrevClientRocket[entity] = INVALID_ROCKET_INDEX;
+	g_iNextClientRocket[entity] = g_iFirstClientRocket[owner];
+	if (g_iFirstClientRocket[owner] != INVALID_ROCKET_INDEX)
+		g_iPrevClientRocket[g_iFirstClientRocket[owner]] = entity;
+	g_iFirstClientRocket[owner] = entity;
+}
+
+void RemoveRocketFromLists(int entity)
+{
+	int next = g_iNextTrackedRocket[entity];
+	int prev = g_iPrevTrackedRocket[entity];
+	if (prev != INVALID_ROCKET_INDEX)
+		g_iNextTrackedRocket[prev] = next;
+	else if (g_iFirstTrackedRocket == entity)
+		g_iFirstTrackedRocket = next;
+
+	if (next != INVALID_ROCKET_INDEX)
+		g_iPrevTrackedRocket[next] = prev;
+
+	int owner = g_iRocketOwner[entity];
+	next = g_iNextClientRocket[entity];
+	prev = g_iPrevClientRocket[entity];
+	if (1 <= owner <= MaxClients) {
+		if (prev != INVALID_ROCKET_INDEX)
+			g_iNextClientRocket[prev] = next;
+		else if (g_iFirstClientRocket[owner] == entity)
+			g_iFirstClientRocket[owner] = next;
+
+		if (next != INVALID_ROCKET_INDEX)
+			g_iPrevClientRocket[next] = prev;
 	}
 }
 
@@ -408,8 +553,7 @@ bool IsHumanPlayer(int client)
 
 bool IsDetectorActive()
 {
-	return g_cvEnabled.BoolValue
-		&& !g_bJumpQoLLoaded;
+	return g_cvEnabled.BoolValue;
 }
 
 bool IsClientDetectorActive(int client)
@@ -429,10 +573,10 @@ bool IsTrackedRocket(int entity)
 		&& EntRefToEntIndex(ref) == entity;
 }
 
-void GetRocketAges(int owner, int entity, int currentTick, int &cmdAge, int &tickAge)
+void GetRocketAges(int owner, int entity, int &cmdAge, int &simAge)
 {
 	cmdAge = g_iCmdSerial[owner] - g_iRocketCreatedCmd[entity];
-	tickAge = currentTick - g_iRocketCreatedTick[entity];
+	simAge = g_iRocketSimCount[entity];
 }
 
 void FormatSignedDelta(int value, char[] buffer, int maxlen)
